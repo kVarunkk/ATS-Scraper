@@ -13,18 +13,20 @@ def get_connection():
 
 
 def upsert_company(conn, slug: str, platform: str, company_url: str):
-    """Insert a newly discovered company, or bump last_checked_at if it already exists."""
+    """Insert a newly discovered company, or update it if it already exists."""
     with conn.cursor() as cur:
         cur.execute(
             """
             insert into companies (slug, platform, company_url, last_checked_at)
             values (%s, %s, %s, now())
             on conflict (slug, platform)
-            do update set last_checked_at = now(), is_active = true
+            do update set
+                company_url = excluded.company_url,
+                last_checked_at = now(),
+                is_active = true
             """,
             (slug, platform, company_url),
         )
-
 
 def get_companies(conn, platform: str | None = None):
     """Return companies to scrape, optionally filtered to one platform."""

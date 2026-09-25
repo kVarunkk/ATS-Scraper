@@ -11,13 +11,18 @@ import argparse
 import time
 
 from db import get_connection, get_companies, upsert_job, mark_missing_jobs_inactive
-from adapters import ashby, greenhouse, lever, rippling
+from adapters import ashby, greenhouse, lever, rippling, workable, recruitee, personio, jobvite, jazzhr
 
 ADAPTERS = {
     "ashby": ashby.fetch_jobs,
     "greenhouse": greenhouse.fetch_jobs,
     "lever": lever.fetch_jobs,
-    "rippling": rippling.fetch_jobs
+    "rippling": rippling.fetch_jobs,
+    "workable": workable.fetch_jobs,
+    "recruitee": recruitee.fetch_jobs,
+    "personio": personio.fetch_jobs,
+    "jobvite": jobvite.fetch_jobs,
+    "jazzhr": jazzhr.fetch_jobs
 }
 
 
@@ -35,6 +40,7 @@ def run(platforms: list[str]):
             for company in companies:
                 slug = company["slug"]
                 company_url = company["company_url"]
+
                 try:
                     jobs = fetch_jobs(slug, company_url)
                 except Exception as e:

@@ -1,9 +1,9 @@
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
-from bs4 import BeautifulSoup
+from utils.extract_text import extract_text
 
 JOBS_URL = "https://api.rippling.com/platform/api/ats/v1/board/{slug}/jobs"
-
+JOB_DETAIL_URL = "https://api.rippling.com/platform/api/ats/v1/board/{slug}/jobs/{uuid}"
 JOB_TYPE_MAP = {
     "SALARIED_FT": "Fulltime",
     "SALARIED_PT": "Intern",
@@ -22,11 +22,15 @@ def _fetch(slug: str):
     resp.raise_for_status()
     return resp.json()
 
-def extract_text(html: str) -> str:
-    html_content = html 
-    soup = BeautifulSoup(html_content, "html.parser")
-    clean_text = soup.get_text(separator="\n", strip=True)
-    return clean_text
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _fetch_job_detail(slug: str, uuid: str):
+    resp = requests.get(JOB_DETAIL_URL.format(slug=slug, uuid=uuid), timeout=20)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp.json()    
+
+
 
     
 def _extract_list(data) -> list:
@@ -67,27 +71,30 @@ def fetch_jobs(slug: str, company_url: str) -> list[dict]:
         uuid = posting.get("uuid")
         job_url = posting.get("url") or (f"https://ats.rippling.com/{slug}/jobs/{uuid}" if uuid else None)
 
-        description = posting.get("description") or {}
+        detail = _fetch_job_detail(slug, uuid) if uuid else None
+        source = detail or posting
+
+        description = source.get("description") or {}
         description_text = None
         if isinstance(description, dict):
             description_text = (description.get("role") or "") + (description.get("company") or "")
         elif isinstance(description, str):
             description_text = description
 
-        description_text = extract_text(description_text)    
+        description_text = extract_text(description_text or "")
 
-        employment_type = posting.get("employmentType") or {}
-        salary_range, salary_min, salary_max = _format_salary(posting.get("payRangeDetails"))
-        company_name = posting.get("companyName") or (posting.get("board") or {}).get("companyName") or slug
+        employment_type = source.get("employmentType") or {}
+        salary_range, salary_min, salary_max = _format_salary(source.get("payRangeDetails"))
+        company_name = source.get("companyName") or (source.get("board") or {}).get("companyName") or slug
 
         jobs.append({
             "job_url": job_url,
-            "locations": posting.get("workLocations") or [],
+            "locations": source.get("workLocations") or [],
             "job_type": JOB_TYPE_MAP.get(employment_type.get("label") or "", "Fulltime"),
             "salary_range": salary_range,
             "salary_min": salary_min,
             "salary_max": salary_max,
-            "job_name": posting.get("name"),
+            "job_name": source.get("name"),
             "description": description_text,
             "company_url": company_url,
             "company_name": company_name,
