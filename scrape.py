@@ -11,7 +11,7 @@ import argparse
 import time
 
 from db import get_connection, get_companies, upsert_job, mark_missing_jobs_inactive
-from adapters import ashby, greenhouse, lever, rippling, workable, recruitee, personio, jobvite, jazzhr
+from adapters import ashby, greenhouse, lever, rippling, workable, recruitee, personio, jobvite, jazzhr, bamboohr, workday
 
 ADAPTERS = {
     "ashby": ashby.fetch_jobs,
@@ -22,7 +22,9 @@ ADAPTERS = {
     "recruitee": recruitee.fetch_jobs,
     "personio": personio.fetch_jobs,
     "jobvite": jobvite.fetch_jobs,
-    "jazzhr": jazzhr.fetch_jobs
+    "jazzhr": jazzhr.fetch_jobs,
+    "bamboohr": bamboohr.fetch_jobs,
+    "workday": workday.fetch_jobs
 }
 
 

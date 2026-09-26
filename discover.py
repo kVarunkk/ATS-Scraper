@@ -31,8 +31,8 @@ SUBDOMAIN_PLATFORM_DOMAINS = {
     "jazzhr": ["applytojob.com"],
     "recruitee": ["recruitee.com"],
     "personio": ["jobs.personio.de"],
-    # todo: playwright scraping
-    "bamboohr": ["bamboohr.com"]
+    "bamboohr": ["bamboohr.com"],
+    "workday": ["wd1.myworkdayjobs.com", "wd3.myworkdayjobs.com", "wd5.myworkdayjobs.com"]
 }
 
 EXCLUDE_SLUGS = {"embed", "api", "static", "assets", "favicon.ico"}
@@ -131,6 +131,48 @@ def query_cdx_subdomain(domain: str, crawl_id: str) -> set[str]:
 
     return slugs
 
+def query_workday_urls(domain: str, crawl_id: str) -> set[str]:
+    """Returns the set of full workday career base URLs found before '/job'."""
+    base_url = f"https://index.commoncrawl.org/{crawl_id}-index"
+    career_urls = set()
+
+    resp = requests.get(base_url, params={
+        "url": domain, "matchType": "domain", "output": "json", "showNumPages": "true",
+    }, timeout=30)
+    if resp.status_code != 200:
+        print(f"  [{domain}] index query failed ({resp.status_code}), skipping")
+        return career_urls
+    num_pages = resp.json().get("pages", 1)
+
+    for page in range(num_pages):
+        for attempt in range(5):
+            try:
+                resp = requests.get(base_url, params={
+                    "url": domain, "matchType": "domain", "output": "json", "fl": "url", "page": page,
+                }, timeout=60)
+                resp.raise_for_status()
+                break
+            except requests.RequestException as e:
+                print(f"  [{domain}] page {page} attempt {attempt + 1} failed: {e}")
+                time.sleep(2 ** attempt)
+        else:
+            continue
+
+        for line in resp.text.strip().splitlines():
+            try:
+                url = json.loads(line)["url"]
+                if "/job/" in url:
+                    # Split at /job/ to get everything before it
+                    base_career_url = url.split("/job/")[0]
+                    career_urls.add(base_career_url)
+            except (IndexError, KeyError, ValueError):
+                continue
+
+        time.sleep(0.5)
+
+    return career_urls
+
+
 def run(platforms: list[str]):
     crawl_id = get_latest_crawl_id()
     print(f"Using crawl: {crawl_id}\n")
@@ -148,6 +190,22 @@ def run(platforms: list[str]):
                         company_url = f"https://{domain}/{slug}"
                         upsert_company(conn, slug, platform, company_url)
                     conn.commit()
+
+            elif platform == "workday":
+                for domain in SUBDOMAIN_PLATFORM_DOMAINS["workday"]:
+                    print(f"Querying Workday *.{domain} ...")
+                    career_urls = query_workday_urls(domain, crawl_id)
+                    print(f"  found {len(career_urls)} career base URLs")
+
+                    for company_url in career_urls:
+                        # Extract a clean slug/identifier from the URL (e.g., '2020companies' from the netloc)
+                        parsed = urlparse(company_url)
+                        # subdomain = parsed.netloc.split('.')[0]
+                        # slug = f"{subdomain}_{parsed.path.strip('/').replace('/', '_')}"
+                        slug = parsed.netloc.split('.')[0]
+                        
+                        upsert_company(conn, slug, platform, company_url)
+                    conn.commit()        
 
             elif platform in SUBDOMAIN_PLATFORM_DOMAINS:
                 for domain in SUBDOMAIN_PLATFORM_DOMAINS[platform]:
