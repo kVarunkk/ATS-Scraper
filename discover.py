@@ -456,3 +456,5 @@ if __name__ == "__main__":
 
     target_platforms = [args.platform] if args.platform else all_platforms
     run(target_platforms)
+
+    # test: python discover.py --platform greenhouse

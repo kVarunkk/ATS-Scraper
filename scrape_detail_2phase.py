@@ -24,13 +24,18 @@ log = logging.getLogger("scrape_detail")
 
 def run(platforms: list[str], budget_minutes: float, batch_size: int, delay: float):
     deadline = common.Deadline(budget_minutes)
-    conn = db.get_connection()
+    # conn = db.get_connection()
     try:
         for platform in platforms:
             module = registry.TWO_PHASE[platform]
-            backlog = db.get_detail_backlog(conn, platform, batch_size)
+            conn = db.get_connection()
+            try:
+                backlog = db.get_detail_backlog(conn, platform, batch_size)
+            finally:
+                conn.close()
+            # backlog = db.get_detail_backlog(conn, platform, batch_size)
             log.info("%s: %d jobs in detail backlog (batch)", platform, len(backlog))
-            writer = PayloadWriter(conn, platform, mode="detail")
+            # writer = PayloadWriter(conn, platform, mode="detail")
             ok = gone = failed = 0
             try:
                 for row in backlog:
@@ -41,34 +46,72 @@ def run(platforms: list[str], budget_minutes: float, batch_size: int, delay: flo
                     try:
                         detail = module.fetch_detail(job_url)
                     except Exception as e:
-                        conn.rollback()
-                        db.mark_detail_failed(conn, job_url, str(e))
-                        conn.commit()
+                        # conn.rollback()
+                        conn = db.get_connection()
+                        try:
+                            db.mark_detail_failed(conn, job_url, str(e))
+                            conn.commit()
+                        finally:
+                            conn.close()
+                        # db.mark_detail_failed(conn, job_url, str(e))
+                        # conn.commit()
                         failed += 1
                         log.warning("[%s] detail failed %s: %s", platform, job_url, e)
                         time.sleep(delay)
                         continue
 
-                    if detail is None:
-                        db.mark_inactive(conn, [job_url])
+                    conn = db.get_connection()
+                    try:
+                        writer = PayloadWriter(conn, platform, mode="detail")
+                        if detail is None:
+                            db.mark_inactive(conn, [job_url])
+                            conn.commit()
+                            gone += 1
+                        else:
+                            payload = dict(detail)
+                            payload["job_url"] = job_url
+                            payload["company_url"] = row["company_url"]
+                            payload["platform"] = platform
+                            payload["company_name"] = row.get("company_name") or row.get("slug")
+                            writer.add(payload)
+                            ok += 1
+                            
+                            if writer.should_flush():
+                                writer.flush()
                         conn.commit()
-                        gone += 1
-                    else:
-                        payload = dict(detail)
-                        payload["job_url"] = job_url  # keep the exact key stored in jobs_state
-                        payload["company_url"] = row["company_url"]
-                        payload["platform"] = platform
-                        payload["company_name"] = row.get("company_name") or row.get("slug")
-                        writer.add(payload)
-                        ok += 1
-                        if writer.should_flush():
-                            writer.flush()
-                    time.sleep(delay)
+                    finally:
+                        conn.close()
+
+                    time.sleep(delay)    
+
+                    # if detail is None:
+                    #     # db.mark_inactive(conn, [job_url])
+                    #     # conn.commit()
+                    #     try:
+                    #         conn = db.get_connection()
+                    #         db.mark_inactive(conn, [job_url])
+                    #         conn.commit()
+                    #     finally:
+                    #         conn.close()
+                    #     gone += 1
+                    # else:
+                    #     payload = dict(detail)
+                    #     payload["job_url"] = job_url  # keep the exact key stored in jobs_state
+                    #     payload["company_url"] = row["company_url"]
+                    #     payload["platform"] = platform
+                    #     payload["company_name"] = row.get("company_name") or row.get("slug")
+                    #     writer.add(payload)
+                    #     ok += 1
+                    #     if writer.should_flush():
+                    #         writer.flush()
+                    # time.sleep(delay)
             finally:
-                writer.flush()
+                pass
+            #     writer.flush()
             log.info("%s: %d ok, %d gone, %d failed", platform, ok, gone, failed)
     finally:
-        conn.close()
+        pass
+        # conn.close()
 
 
 if __name__ == "__main__":
@@ -85,3 +128,5 @@ if __name__ == "__main__":
         args.batch_size,
         args.delay,
     )
+
+    # test: python scrape_detail_2phase.py --platform jazzhr --budget-minutes 5

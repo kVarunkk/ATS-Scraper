@@ -84,3 +84,5 @@ if __name__ == "__main__":
     parser.add_argument("--delay", type=float, default=0.5, help="seconds between companies")
     args = parser.parse_args()
     run([args.platform] if args.platform else list(registry.TWO_PHASE), args.budget_minutes, args.delay)
+
+    # test: python scrape_list_2phase.py --platform jazzhr --budget-minutes 5
