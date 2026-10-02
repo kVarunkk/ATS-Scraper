@@ -22,6 +22,7 @@ SINGLE_CALL = {
     "personio": personio,
 }
 
+# tested
 TWO_PHASE = {
     "jazzhr": jazzhr,
     "bamboohr": bamboohr,

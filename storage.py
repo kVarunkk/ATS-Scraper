@@ -16,6 +16,7 @@ from google.api_core.exceptions import PreconditionFailed
 from google.cloud import storage as gcs
 from google.oauth2 import service_account
 
+import common
 import db
 
 _client = None
@@ -72,10 +73,10 @@ class PayloadWriter:
     mode="detail": two-phase detail step, completes existing pending rows.
     """
  
-    def __init__(self, conn, platform: str, mode: str, flush_jobs: int = 500, flush_seconds: int = 1200):
+    def __init__(self, platform: str, mode: str, flush_jobs: int = 500, flush_seconds: int = 1200):
         if mode not in ("insert", "detail"):
             raise ValueError(mode)
-        self.conn = conn
+        # self.conn = conn
         self.platform = platform
         self.mode = mode
         self.flush_jobs = flush_jobs
@@ -105,16 +106,17 @@ class PayloadWriter:
         records = list(self.records.values())
  
         put_jsonl_gz(key, records)
- 
-        if self.mode == "insert":
-            db.upsert_state_with_payload(
-                self.conn,
-                [(r["job_url"], r["company_url"], r["platform"]) for r in records],
-                key,
-            )
-        else:
-            db.complete_details(self.conn, [r["job_url"] for r in records], key)
-        self.conn.commit()
+
+        with common.db_conn() as conn:
+            if self.mode == "insert":
+                db.upsert_state_with_payload(
+                    conn,
+                    [(r["job_url"], r["company_url"], r["platform"]) for r in records],
+                    key,
+                )
+            else:
+                db.complete_details(conn, [r["job_url"] for r in records], key)
+        # conn.commit()
  
         self.part += 1
         self.records = {}

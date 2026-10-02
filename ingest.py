@@ -57,36 +57,39 @@ def _to_row(rec: dict) -> dict:
     row["locations"] = row["locations"] or []
     return row
 
-
 def run():
-    state_conn = db.get_connection()
-    same_db = db.BOARD_DATABASE_URL == db.DATABASE_URL
-    board_conn = state_conn if same_db else db.get_connection(db.BOARD_DATABASE_URL)
-    try:
-        watermark = db.get_watermark(state_conn, "board")
-        changed = db.get_changed_state(state_conn, watermark)
-        if not changed:
-            log.info("nothing to ingest")
-            return
+    with common.db_conn() as conn:
+        watermark = db.get_watermark(conn, "board")
+        changed = db.get_changed_state(conn, watermark)
 
-        inactive = [r["job_url"] for r in changed if r["status"] == "inactive"]
-        by_key: dict[str, set[str]] = defaultdict(set)
-        for r in changed:
-            if r["status"] == "active":
-                by_key[r["payload_key"]].add(r["job_url"])
+    if not changed:
+        log.info("nothing to ingest")
+        return
 
-        upserted = 0
-        for key, wanted in by_key.items():
-            batch = [_to_row(rec) for rec in read_jsonl_gz(key) if rec.get("job_url") in wanted]
-            found = {r["job_url"] for r in batch}
-            if wanted - found:
-                log.warning("%s: %d expected jobs not found in payload", key, len(wanted - found))
+    board_url = None if db.BOARD_DATABASE_URL == db.DATABASE_URL else db.BOARD_DATABASE_URL
+
+    inactive = [r["job_url"] for r in changed if r["status"] == "inactive"]
+    by_key: dict[str, set[str]] = defaultdict(set)
+    for r in changed:
+        if r["status"] == "active":
+            by_key[r["payload_key"]].add(r["job_url"])
+
+    upserted = 0
+    for key, wanted in by_key.items():
+        # R2 download and parsing: no DB connection held
+        batch = [_to_row(rec) for rec in read_jsonl_gz(key) if rec.get("job_url") in wanted]
+        found = {r["job_url"] for r in batch}
+        if wanted - found:
+            log.warning("%s: %d expected jobs not found in payload", key, len(wanted - found))
+
+        with common.db_conn(board_url) as board_conn:
             with board_conn.cursor() as cur:
                 for i in range(0, len(batch), CHUNK):
                     execute_values(cur, UPSERT_SQL, batch[i:i + CHUNK], template=TEMPLATE)
-            upserted += len(batch)
+        upserted += len(batch)
 
-        closed = 0
+    closed = 0
+    with common.db_conn(board_url) as board_conn:
         with board_conn.cursor() as cur:
             for i in range(0, len(inactive), 1000):
                 cur.execute(
@@ -97,15 +100,11 @@ def run():
                     (inactive[i:i + 1000],),
                 )
                 closed += cur.rowcount
-        board_conn.commit()
 
-        db.set_watermark(state_conn, "board", max(r["updated_at"] for r in changed))
-        state_conn.commit()
-        log.info("ingested %d jobs, closed %d", upserted, closed)
-    finally:
-        if board_conn is not state_conn:
-            board_conn.close()
-        state_conn.close()
+    with common.db_conn() as conn:
+        db.set_watermark(conn, "board", max(r["updated_at"] for r in changed))
+
+    log.info("ingested %d jobs, closed %d", upserted, closed)
 
 
 if __name__ == "__main__":

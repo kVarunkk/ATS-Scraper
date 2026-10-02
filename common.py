@@ -1,6 +1,8 @@
 import inspect
 import logging
 import time
+from contextlib import contextmanager
+import db
 
 MAX_CLOSE_HOLDS = 2
 
@@ -41,3 +43,16 @@ def call_fetch_jobs(module, company: dict):
     if "company_name" in inspect.signature(fn).parameters:
         return fn(company["slug"], company["company_url"], company_name=company.get("company_name"))
     return fn(company["slug"], company["company_url"])
+
+
+@contextmanager
+def db_conn(url: str | None = None):
+    conn = db.get_connection(url) if url else db.get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()        

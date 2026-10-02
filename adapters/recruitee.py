@@ -37,18 +37,30 @@ def _extract_list_recruitee(data) -> list:
     return []
 
 
+def _to_num(v) -> float | None:
+    if v is None or v == "":
+        return None
+    try:
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
 def _format_salary_recruitee(salary) -> tuple[str | None, float | None, float | None]:
     if not salary or not isinstance(salary, dict):
         return None, None, None
-    try:
-        lo = salary.get("min")
-        hi = salary.get("max")
-        currency = salary.get("currency", "")
-        if lo and hi:
-            return f"{currency} {lo:,.0f} - {hi:,.0f}", lo, hi
-    except (KeyError, TypeError):
-        pass
-    return None, None, None
+
+    lo = _to_num(salary.get("min"))
+    hi = _to_num(salary.get("max"))
+    if lo is None or hi is None:
+        return None, lo, hi
+
+    currency = (salary.get("currency") or "").strip()
+    period = (salary.get("period") or "").strip()
+    text = f"{currency} {lo:,.0f} - {hi:,.0f}"
+    if period:
+        text += f" / {period}"
+    return text.strip(), lo, hi
 
 
 def fetch_jobs(slug: str, company_url: str) -> list[dict]:

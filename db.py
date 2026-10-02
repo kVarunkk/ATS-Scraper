@@ -181,18 +181,18 @@ def record_success(conn, company_id: int, close_holds: int = 0):
         )
 
 
-def record_failure(conn, company_id: int, gone: bool):
+def record_failure(conn, company_id: int, gone: bool, error: str | None = None):
     """gone=True means the board returned 404. gone=False means an error.
     last_scraped_at is bumped either way so failing companies do not hog the front of the queue."""
     with conn.cursor() as cur:
         cur.execute(
             """
             update companies
-            set consecutive_failures = coalesce(consecutive_failures, 0) + 1, last_scraped_at = now()
+            set last_error = %s, consecutive_failures = coalesce(consecutive_failures, 0) + 1, last_scraped_at = now()
             where id = %s
             returning consecutive_failures, company_url, platform
             """,
-            (company_id,),
+            ((error or "")[:1000] or None, company_id),
         )
         failures, company_url, platform = cur.fetchone()
         limit = GONE_DEACTIVATE_AFTER if gone else ERROR_DEACTIVATE_AFTER
