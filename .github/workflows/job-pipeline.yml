@@ -60,7 +60,7 @@ jobs:
       fail-fast: false
       matrix:
         # keep in sync with registry.SINGLE_CALL
-        platform: [greenhouse, ashby, lever, rippling, workable, jobvite]
+        platform: [greenhouse, ashby, rippling, workable, personio, recruitee]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -83,7 +83,7 @@ jobs:
       fail-fast: false
       matrix:
         # keep in sync with registry.TWO_PHASE
-        platform: [jazzhr, recruitee, personio, bamboohr, workday]
+        platform: [jazzhr, jobvite, bamboohr, workday]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
