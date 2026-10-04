@@ -1,16 +1,19 @@
 """
 Pushes changes from jobs_state + R2 payloads into the board table (all_jobs).
 
-  1. read jobs_state rows changed since the watermark
-  2. group active rows by payload_key, download each R2 file once, upsert matching jobs
-  3. mark newly inactive jobs inactive on the board
-  4. advance the watermark only after everything succeeded
+  1. read jobs_state rows changed since the watermark, oldest first
+  2. work through them in time-ordered windows; for each window:
+       group active rows by payload_key, download each file once, upsert matching jobs,
+       mark newly inactive jobs inactive, then advance the watermark to the end of the window
+  3. stop between windows when the time budget runs out; the next run resumes from the watermark
 
-Safe to re-run: every write is an idempotent upsert.
+Safe to re-run: every write is an idempotent upsert, and the watermark only moves past
+windows that fully succeeded.
 
 Usage:
-    python ingest.py
+    python ingest.py --budget-minutes 40
 """
+import argparse
 import logging
 from collections import defaultdict
 
@@ -50,6 +53,7 @@ TEMPLATE = (
 )
 
 CHUNK = 500
+WINDOW_ROWS = 5000  # changed rows per window; the watermark advances after each one
 
 
 def _to_row(rec: dict) -> dict:
@@ -57,20 +61,26 @@ def _to_row(rec: dict) -> dict:
     row["locations"] = row["locations"] or []
     return row
 
-def run():
-    with common.db_conn() as conn:
-        watermark = db.get_watermark(conn, "board")
-        changed = db.get_changed_state(conn, watermark)
 
-    if not changed:
-        log.info("nothing to ingest")
-        return
+def windows(changed: list[dict], size: int):
+    """Split time-ordered rows into windows, never splitting rows that share an updated_at.
 
-    board_url = None if db.BOARD_DATABASE_URL == db.DATABASE_URL else db.BOARD_DATABASE_URL
+    Keeping equal timestamps together matters because the watermark is a single timestamp:
+    ending a window in the middle of a tie could skip the rest of the tie on the next run.
+    """
+    i, n = 0, len(changed)
+    while i < n:
+        j = min(i + size, n)
+        while j < n and changed[j]["updated_at"] == changed[j - 1]["updated_at"]:
+            j += 1
+        yield changed[i:j]
+        i = j
 
-    inactive = [r["job_url"] for r in changed if r["status"] == "inactive"]
+
+def process_window(window: list[dict]) -> tuple[int, int]:
+    inactive = [r["job_url"] for r in window if r["status"] == "inactive"]
     by_key: dict[str, set[str]] = defaultdict(set)
-    for r in changed:
+    for r in window:
         if r["status"] == "active":
             by_key[r["payload_key"]].add(r["job_url"])
 
@@ -82,14 +92,14 @@ def run():
         if wanted - found:
             log.warning("%s: %d expected jobs not found in payload", key, len(wanted - found))
 
-        with common.db_conn(board_url) as board_conn:
+        with common.db_conn() as board_conn:
             with board_conn.cursor() as cur:
                 for i in range(0, len(batch), CHUNK):
                     execute_values(cur, UPSERT_SQL, batch[i:i + CHUNK], template=TEMPLATE)
         upserted += len(batch)
 
     closed = 0
-    with common.db_conn(board_url) as board_conn:
+    with common.db_conn() as board_conn:
         with board_conn.cursor() as cur:
             for i in range(0, len(inactive), 1000):
                 cur.execute(
@@ -101,12 +111,47 @@ def run():
                 )
                 closed += cur.rowcount
 
-    with common.db_conn() as conn:
-        db.set_watermark(conn, "board", max(r["updated_at"] for r in changed))
+    return upserted, closed
 
-    log.info("ingested %d jobs, closed %d", upserted, closed)
+
+def run(budget_minutes: float):
+    deadline = common.Deadline(budget_minutes)
+
+    with common.db_conn() as conn:
+        watermark = db.get_watermark(conn, "board")
+        changed = db.get_changed_state(conn, watermark)
+
+    if not changed:
+        log.info("nothing to ingest")
+        return
+
+    changed = sorted(changed, key=lambda r: r["updated_at"])
+    total_upserted = total_closed = 0
+    done_rows = 0
+
+    for window in windows(changed, WINDOW_ROWS):
+        if deadline.expired():
+            log.info("time budget reached with %d of %d changed rows left, resuming next run",
+                     len(changed) - done_rows, len(changed))
+            break
+
+        upserted, closed = process_window(window)
+
+        # Advance only past this window, and only after every write in it succeeded.
+        with common.db_conn() as conn:
+            db.set_watermark(conn, "board", window[-1]["updated_at"])
+
+        total_upserted += upserted
+        total_closed += closed
+        done_rows += len(window)
+
+    log.info("ingested %d jobs, closed %d (%d/%d changed rows processed)",
+             total_upserted, total_closed, done_rows, len(changed))
 
 
 if __name__ == "__main__":
     common.setup_logging()
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--budget-minutes", type=float, default=40)
+    args = parser.parse_args()
+    run(args.budget_minutes)

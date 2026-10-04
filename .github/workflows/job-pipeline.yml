@@ -1,0 +1,138 @@
+name: job-pipeline
+
+on:
+  schedule:
+    - cron: "0 0 1 * *"   # monthly: discover + full pipeline
+    - cron: "0 2 * * *"   # daily: scrape + ingest + sync
+  workflow_dispatch:
+    inputs:
+      run_discover:
+        description: "Run discovery first"
+        type: boolean
+        default: false
+      budget_minutes:
+        description: "Scrape budget per platform (minutes)"
+        default: "50"
+      detail_budget_minutes:
+        description: "Detail budget per platform (minutes)"
+        default: "15"
+      sync_limit:
+        description: "Listings to keep on the job board"
+        default: "20000"
+      sync_dry_run:
+        description: "Sync step only plans, writes nothing"
+        type: boolean
+        default: false
+
+# Never let two pipeline runs overlap, since they share the same DB state.
+concurrency:
+  group: job-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+  GCS_CREDENTIALS_JSON: ${{ secrets.GCS_CREDENTIALS_JSON }}
+
+jobs:
+  discover:
+    if: >-
+      github.event.schedule == '0 0 1 * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_discover)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python discover.py
+
+  scrape-fast:
+    needs: discover
+    if: ${{ !cancelled() && (needs.discover.result == 'success' || needs.discover.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        # keep in sync with registry.SINGLE_CALL
+        platform: [greenhouse, ashby, lever, rippling, workable, jobvite]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Scrape ${{ matrix.platform }}
+        run: >-
+          python scrape_fast.py
+          --platform ${{ matrix.platform }}
+          --budget-minutes ${{ inputs.budget_minutes || '50' }}
+
+  scrape-2phase:
+    needs: discover
+    if: ${{ !cancelled() && (needs.discover.result == 'success' || needs.discover.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        # keep in sync with registry.TWO_PHASE
+        platform: [jazzhr, recruitee, personio, bamboohr, workday]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: List ${{ matrix.platform }}
+        run: >-
+          python scrape_list_2phase.py
+          --platform ${{ matrix.platform }}
+          --budget-minutes ${{ inputs.budget_minutes || '50' }}
+      - name: Detail ${{ matrix.platform }}
+        run: >-
+          python scrape_detail_2phase.py
+          --platform ${{ matrix.platform }}
+          --budget-minutes ${{ inputs.detail_budget_minutes || '15' }}
+
+  ingest:
+    needs: [scrape-fast, scrape-2phase]
+    # run even if some platforms failed, so successful ones still get ingested
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python ingest.py --budget-minutes 40
+
+  sync-board:
+    needs: ingest
+    if: ${{ !cancelled() && needs.ingest.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_BOARD_DATABASE_URL: ${{ secrets.JOB_BOARD_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Push listings to the job board DB
+        run: >-
+          python sync_to_board.py
+          --limit ${{ inputs.sync_limit || '20000' }}
+          ${{ inputs.sync_dry_run && '--dry-run' || '' }}

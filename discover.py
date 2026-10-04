@@ -174,50 +174,6 @@ def query_workday_urls(domain: str, crawl_id: str) -> set[str]:
     return career_urls
 
 
-# def save(conn, label: str, rows: list[tuple[str, str, str]]):
-#     """Bulk upsert one batch and commit, so a crash later in the run keeps earlier work."""
-#     upsert_companies(conn, rows)
-#     conn.commit()
-#     print(f"  [{label}] saved {len(rows)} companies")
-
-
-# def run(platforms: list[str]):
-#     crawl_id = get_latest_crawl_id()
-#     print(f"Using crawl: {crawl_id}\n")
-
-#     conn = get_connection()
-#     try:
-#         for platform in platforms:
-#             if platform in PLATFORM_DOMAINS:
-#                 for domain in PLATFORM_DOMAINS[platform]:
-#                     print(f"Querying {domain} ...")
-#                     slugs = query_cdx(domain, crawl_id)
-#                     print(f"  found {len(slugs)} slugs")
-#                     rows = [(slug, platform, f"https://{domain}/{slug}") for slug in slugs]
-#                     save(conn, domain, rows)
-
-#             elif platform == "workday":
-#                 for domain in SUBDOMAIN_PLATFORM_DOMAINS["workday"]:
-#                     print(f"Querying Workday *.{domain} ...")
-#                     career_urls = query_workday_urls(domain, crawl_id)
-#                     print(f"  found {len(career_urls)} career base URLs")
-#                     rows = [
-#                         (urlparse(company_url).netloc.split(".")[0], platform, company_url)
-#                         for company_url in career_urls
-#                     ]
-#                     save(conn, domain, rows)
-
-#             elif platform in SUBDOMAIN_PLATFORM_DOMAINS:
-#                 for domain in SUBDOMAIN_PLATFORM_DOMAINS[platform]:
-#                     print(f"Querying *.{domain} ...")
-#                     slugs = query_cdx_subdomain(domain, crawl_id)
-#                     print(f"  found {len(slugs)} slugs")
-#                     suffix = "/careers" if platform == "bamboohr" else ""
-#                     rows = [(slug, platform, f"https://{slug}.{domain}{suffix}") for slug in slugs]
-#                     save(conn, domain, rows)
-#     finally:
-#         conn.close()
-
 def save(label: str, rows: list[tuple[str, str, str]]):
     """Bulk upsert one batch in its own short connection, so earlier work survives a later crash."""
     with common.db_conn() as conn:   # commits on success, rolls back on error

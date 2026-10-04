@@ -123,9 +123,19 @@ def fetch_detail(job_url: str) -> dict | None:
     return {
         "job_name": opening.get("jobOpeningName"),
         "description": extract_text(opening.get("description", "") or ""), 
-        "job_type": opening.get("employmentStatusLabel"),
+        "job_type": _map_job_type(opening.get("employmentType").lower() if opening.get("employmentType") else None),
         "locations": _build_location(opening),
         "salary_range": salary_range,
         "salary_min": salary_min,
         "salary_max": salary_max,
     }
+
+def _map_job_type(raw: str | None) -> str:
+    mapping = {
+        "full-time": "Fulltime",
+        "part-time": "Intern",
+        "contractor": "Contract",
+        "intern": "Intern",
+        "temporary": "Contract",
+    }
+    return mapping.get(raw or "", "Fulltime")    
