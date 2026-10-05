@@ -102,26 +102,11 @@ jobs:
           --platform ${{ matrix.platform }}
           --budget-minutes ${{ inputs.detail_budget_minutes || '15' }}
 
-  ingest:
+  sync-board:
     needs: [scrape-fast, scrape-2phase]
-    # run even if some platforms failed, so successful ones still get ingested
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-      - run: pip install -r requirements.txt
-      - run: python ingest.py --budget-minutes 40
-
-  sync-board:
-    needs: ingest
-    if: ${{ !cancelled() && needs.ingest.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
     env:
       JOB_BOARD_DATABASE_URL: ${{ secrets.JOB_BOARD_DATABASE_URL }}
     steps:
@@ -135,4 +120,19 @@ jobs:
         run: >-
           python sync_to_board.py
           --limit ${{ inputs.sync_limit || '20000' }}
+          --budget-minutes 45
           ${{ inputs.sync_dry_run && '--dry-run' || '' }}
+
+  prune:
+    needs: sync-board
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python prune_scraper_db.py

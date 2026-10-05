@@ -1,17 +1,22 @@
 """
-Syncs a capped, balanced subset of all_jobs from the scraping DB into the
-all_jobs table of the job board DB (small DB, so storage is the constraint).
+Syncs a capped, balanced subset of jobs into the all_jobs table of the job board DB
+(small DB, so storage is the constraint).
+
+The scraper DB no longer needs an all_jobs table. Candidates are chosen from jobs_state
+(small rows: url, company, platform, status, payload file, timestamp), and the full job
+content is read from the GCS payload files only for the jobs that are actually written.
 
 Strategy:
-  1. Delete board jobs that are no longer active in the scraping DB (hard delete frees space).
+  1. Delete board jobs that are no longer active in jobs_state (hard delete frees space).
   2. Keep everything else (sticky, so board listings do not churn between runs).
   3. Compute a fair per-platform quota by water-filling: small platforms keep all they have,
      unused quota is redistributed to big platforms.
   4. Add new jobs up to each platform's quota, newest first, with a per-company cap so one
      huge employer cannot flood the board. If the board is full, evict the oldest jobs
      from platforms that are over quota.
-  5. Refresh kept jobs whose content changed in the scraping DB.
-  6. Refuse to add anything if the board DB is already above a size ceiling.
+  5. Refresh kept jobs whose state changed (reopened, or platform label differs).
+  6. Cap the number of adds so the projected DB size, including embeddings that
+     are still to be generated, stays under --max-db-mb.
 
 Only rows with is_platform_job = false are ever read, counted, updated or deleted, so the
 board's own platform jobs are never touched. The cap is enforced by the plan (adds only fill
@@ -35,6 +40,7 @@ from collections import Counter
 from psycopg2.extras import RealDictCursor, execute_values
 
 import common
+from storage import read_jsonl_gz
 
 log = logging.getLogger("sync_board")
 
@@ -130,19 +136,51 @@ def read_board(conn) -> dict:
         return {r["job_url"]: r for r in cur.fetchall()}
 
 
-def board_size_mb(conn) -> float:
+DEFAULT_EMBEDDING_BYTES = 12_300  # 3072-dim vector; used only if no row has an embedding yet
+
+
+def board_size_stats(conn) -> dict:
+    """Database size plus what is needed to project the cost of a new row, embedding included."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("select pg_database_size(current_database()) / 1024.0 / 1024.0 as mb")
-        return float(cur.fetchone()["mb"])
+        cur.execute(
+            """
+            select pg_database_size(current_database()) as db_bytes,
+                   pg_total_relation_size('public.all_jobs') as table_bytes,
+                   count(*) as n_rows,
+                   count(embedding_new) as n_embedded,
+                   coalesce(avg(pg_column_size(embedding_new)), 0) as emb_bytes
+            from public.all_jobs
+            """
+        )
+        return {k: float(v) for k, v in cur.fetchone().items()}
+
+
+def max_adds_for_size(st: dict, ceiling_mb: float) -> tuple[int, float]:
+    """How many new rows fit under the size ceiling.
+
+    Counts the embeddings that existing rows are still waiting for, and gives every new row the
+    cost of its text and indexes plus its own future embedding. Dead space from earlier deletes
+    inflates the per-row figure, so the estimate errs on the cautious side.
+    """
+    emb = st["emb_bytes"] or DEFAULT_EMBEDDING_BYTES
+    n_rows = max(st["n_rows"], 1)
+    base_per_row = max((st["table_bytes"] - st["n_embedded"] * emb) / n_rows, 0)
+    pending_embeddings = (st["n_rows"] - st["n_embedded"]) * emb
+    headroom = ceiling_mb * 1024 * 1024 - st["db_bytes"] - pending_embeddings
+    per_new_row = base_per_row + emb
+    return max(0, int(headroom // per_new_row)), per_new_row
 
 
 def source_live(conn, urls) -> dict:
-    """url -> {updated_at, platform} for the given urls that are still active in the scraping DB."""
+    """url -> {updated_at, platform, payload_key} for the given urls still active in jobs_state."""
     live = {}
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         for part in chunks(urls, 2000):
             cur.execute(
-                "select job_url, updated_at, platform from all_jobs where status = 'active' and job_url = any(%s)",
+                """
+                select job_url, updated_at, platform, payload_key
+                from jobs_state where status = 'active' and job_url = any(%s)
+                """,
                 (part,),
             )
             for r in cur.fetchall():
@@ -152,20 +190,22 @@ def source_live(conn, urls) -> dict:
 
 def source_platforms(conn) -> list[str]:
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("select distinct platform from all_jobs where status = 'active'")
+        cur.execute(
+            "select distinct platform from jobs_state where status = 'active' and payload_key is not null"
+        )
         return [r["platform"] for r in cur.fetchall()]
 
 
 def source_candidates(conn, platform: str, per_company_cap: int, limit: int) -> list[dict]:
-    """Lightweight rows (no description), newest first, at most per_company_cap per company."""
+    """Newest first, at most per_company_cap per company. Only jobs whose content is in a payload file."""
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
             """
-            select job_url, updated_at from (
-                select job_url, updated_at,
+            select job_url, updated_at, payload_key from (
+                select job_url, updated_at, payload_key,
                        row_number() over (partition by company_url order by updated_at desc) as rn
-                from all_jobs
-                where status = 'active' and platform = %s
+                from jobs_state
+                where status = 'active' and platform = %s and payload_key is not null
             ) t
             where rn <= %s
             order by updated_at desc
@@ -176,16 +216,16 @@ def source_candidates(conn, platform: str, per_company_cap: int, limit: int) -> 
         return cur.fetchall()
 
 
-def fetch_full(conn, urls, map_job_type) -> list[dict]:
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            f"select {COLS}, updated_at from all_jobs where job_url = any(%s)",
-            (list(urls),),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    for r in rows:
-        r["locations"] = r["locations"] or []
-        r["job_type"] = map_job_type(r["job_type"])  # NOT NULL enum on the board
+def load_rows(key: str, wanted: dict) -> list[dict]:
+    """Read one GCS payload file and return board rows for the wanted urls (url -> updated_at)."""
+    rows = []
+    for rec in read_jsonl_gz(key):
+        url = rec.get("job_url")
+        if url in wanted:
+            row = {f: rec.get(f) for f in FIELDS}
+            row["locations"] = row["locations"] or []
+            row["updated_at"] = wanted[url]
+            rows.append(row)
     return rows
 
 
@@ -226,8 +266,10 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
     with common.db_conn(board_url) as board:
         board_rows = read_board(board)
         map_job_type, unmapped = make_job_type_mapper(load_job_types(board))
-        size_mb = board_size_mb(board)
-    log.info("board: %d rows, db size %.1f MB", len(board_rows), size_mb)
+        stats = board_size_stats(board)
+    size_mb = stats["db_bytes"] / 1024 / 1024
+    log.info("board: %d rows (%d embedded), db size %.1f MB",
+             len(board_rows), int(stats["n_embedded"]), size_mb)
 
     # Phase 2: read the scraping DB (one short connection for every read)
     with common.db_conn() as src:
@@ -250,8 +292,9 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
 
     refresh = [
         u for u in keep
-        if newer(live[u]["updated_at"], board_rows[u]["updated_at"])
-        or live[u]["platform"] != board_rows[u]["platform"]
+        if live[u]["payload_key"]
+        and (newer(live[u]["updated_at"], board_rows[u]["updated_at"])
+             or live[u]["platform"] != board_rows[u]["platform"])
     ]
 
     new_by_platform = {
@@ -264,20 +307,22 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
         p: len(kept_by_platform.get(p, [])) + len(new_by_platform.get(p, []))
         for p in platforms
     }
-    quota = fair_quota(available, limit)
+    # Size cap: never plan more rows than fit under the DB size ceiling, embeddings included
+    max_adds, per_new_row = max_adds_for_size(stats, max_db_mb)
+    effective_limit = min(limit, len(keep) + max_adds)
+    log.info("size: ~%.1f KB per new row with its embedding, ceiling %.0f MB -> room for %d new rows",
+             per_new_row / 1024, max_db_mb, max_adds)
+    if effective_limit < limit:
+        log.warning("size ceiling caps the board at %d rows (limit was %d)", effective_limit, limit)
+    quota = fair_quota(available, effective_limit)
 
-    adds: list[str] = []
+    adds: list[dict] = []
     for p in platforms:
         want = max(0, quota[p] - len(kept_by_platform.get(p, [])))
-        adds += [c["job_url"] for c in new_by_platform.get(p, [])[:want]]
-
-    # Size guard: never grow a DB that is already near its ceiling
-    if size_mb > max_db_mb and adds:
-        log.warning("board DB is %.1f MB (ceiling %.1f MB), skipping %d adds", size_mb, max_db_mb, len(adds))
-        adds = []
+        adds += new_by_platform.get(p, [])[:want]
 
     # Evict oldest jobs from over-quota platforms, only as many as the adds need
-    free = limit - len(keep)
+    free = effective_limit - len(keep)
     need_evict = max(0, len(adds) - free)
     evict: list[str] = []
     if need_evict:
@@ -319,22 +364,38 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
                 )
     # committed here, connection closed
 
-    to_write = adds + refresh
+    # Group everything to write by payload file, so each file is downloaded once.
+    want_by_key: dict[str, dict] = {}
+    for c in adds:
+        want_by_key.setdefault(c["payload_key"], {})[c["job_url"]] = c["updated_at"]
+    for u in refresh:
+        want_by_key.setdefault(live[u]["payload_key"], {})[u] = live[u]["updated_at"]
+    total_writes = sum(len(w) for w in want_by_key.values())
+
     written = 0
-    for part in chunks(to_write, WRITE_CHUNK):
+    # Files with the most wanted jobs first, so a budget cut still lands as many jobs as possible.
+    for key, wanted in sorted(want_by_key.items(), key=lambda kv: -len(kv[1])):
         if deadline.expired():
             log.info("time budget reached with %d of %d writes left, resuming next run",
-                     len(to_write) - written, len(to_write))
+                     total_writes - written, total_writes)
             break
-        with common.db_conn() as src:
-            rows = fetch_full(src, part, map_job_type)
-        with common.db_conn(board_url) as board:
-            with board.cursor() as cur:
-                # Tell the insert trigger not to fire one HTTP request per row; a rate-limited
-                # background worker (embed_pending_jobs) embeds new rows instead.
-                cur.execute("set local app.skip_embedding = 'on'")
-                execute_values(cur, UPSERT_SQL, rows, template=TEMPLATE)
-        written += len(part)
+        try:
+            rows = load_rows(key, wanted)  # GCS download and parsing, no DB connection held
+        except Exception as e:
+            log.warning("%s: could not read payload (%s), those jobs stay queued", key, e)
+            continue
+        if len(rows) < len(wanted):
+            log.warning("%s: %d expected jobs not found in payload", key, len(wanted) - len(rows))
+        for r in rows:
+            r["job_type"] = map_job_type(r["job_type"])  # NOT NULL enum on the board
+        for part in chunks(rows, WRITE_CHUNK):
+            with common.db_conn(board_url) as board:
+                with board.cursor() as cur:
+                    # Tell the insert trigger not to fire one HTTP request per row; a rate-limited
+                    # background worker (embed_pending_jobs) embeds new rows instead.
+                    cur.execute("set local app.skip_embedding = 'on'")
+                    execute_values(cur, UPSERT_SQL, part, template=TEMPLATE)
+        written += len(wanted)
 
     # Safety net: the plan should make this impossible, so fail loudly if it is ever wrong.
     with common.db_conn(board_url) as board:
@@ -342,7 +403,7 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
     if total > limit:
         raise RuntimeError(f"board holds {total} scraped jobs, over the limit of {limit}")
 
-    log.info("done: board holds %d scraped jobs (%d/%d writes done)", total, written, len(to_write))
+    log.info("done: board holds %d scraped jobs (%d/%d writes done)", total, written, total_writes)
     if unmapped:
         log.warning("job_type values not in the enum, defaulted: %s", unmapped.most_common(10))
 
@@ -353,6 +414,7 @@ def run(limit: int, per_company_cap: int, max_db_mb: float, dry_run: bool, budge
             if cur.fetchone()["pending"]:
                 cur.execute("set local statement_timeout = '15min'")
                 cur.execute(f"select {NORMALIZE_FN}()")
+                log.info("normalized job locations (%s)", NORMALIZE_FN)
             else:
                 log.info("no jobs need location normalization")
 
@@ -363,7 +425,7 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=20000, help="max listings on the job board")
     parser.add_argument("--per-company-cap", type=int, default=50, help="max listings per company")
     parser.add_argument("--max-db-mb", type=float, default=430, help="skip adds above this DB size")
-    parser.add_argument("--budget-minutes", type=float, default=20, help="stop writing after this long")
+    parser.add_argument("--budget-minutes", type=float, default=45, help="stop writing after this long")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     run(args.limit, args.per_company_cap, args.max_db_mb, args.dry_run, args.budget_minutes)
