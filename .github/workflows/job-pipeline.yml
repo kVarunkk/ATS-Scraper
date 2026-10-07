@@ -18,7 +18,7 @@ on:
         default: "15"
       sync_limit:
         description: "Listings to keep on the job board"
-        default: "20000"
+        default: "15000"
       sync_dry_run:
         description: "Sync step only plans, writes nothing"
         type: boolean
@@ -119,7 +119,7 @@ jobs:
       - name: Push listings to the job board DB
         run: >-
           python sync_to_board.py
-          --limit ${{ inputs.sync_limit || '20000' }}
+          --limit ${{ inputs.sync_limit || '15000' }}
           --budget-minutes 45
           ${{ inputs.sync_dry_run && '--dry-run' || '' }}
 
