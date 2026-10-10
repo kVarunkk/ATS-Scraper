@@ -14,7 +14,7 @@ import requests
 import json
 from urllib.parse import urlparse
 import common
-from db import get_connection, upsert_companies
+from db import upsert_companies
 
 COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
 
@@ -34,7 +34,9 @@ SUBDOMAIN_PLATFORM_DOMAINS = {
     "recruitee": ["recruitee.com"],
     "personio": ["jobs.personio.de"],
     "bamboohr": ["bamboohr.com"],
-    "workday": ["wd1.myworkdayjobs.com", "wd3.myworkdayjobs.com", "wd5.myworkdayjobs.com"]
+    "workday": ["wd1.myworkdayjobs.com", "wd3.myworkdayjobs.com", "wd5.myworkdayjobs.com"],
+    "keka": ["keka.com"],
+    # "eightfoldai": ["eightfold.ai"]
 }
 
 EXCLUDE_SLUGS = {"embed", "api", "static", "assets", "favicon.ico"}
@@ -210,7 +212,7 @@ def run(platforms: list[str]):
                 print(f"Querying *.{domain} ...")
                 slugs = query_cdx_subdomain(domain, crawl_id)
                 print(f"  found {len(slugs)} slugs")
-                suffix = "/careers" if platform == "bamboohr" else ""
+                suffix = "/careers" if platform == "bamboohr" or platform == "keka" or platform == "eightfoldai" else ""
                 rows = [(slug, platform, f"https://{slug}.{domain}{suffix}") for slug in slugs]
                 save(domain, rows)
 

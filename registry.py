@@ -9,7 +9,7 @@ Contract for all: None means gone, [] means a real empty board, exceptions mean 
 """
 from adapters import (
     ashby, greenhouse, lever, rippling, workable,
-    recruitee, personio, jobvite, jazzhr, bamboohr, workday,
+    recruitee, personio, jobvite, jazzhr, bamboohr, workday, keka
 )
 
 SINGLE_CALL = {
@@ -20,6 +20,7 @@ SINGLE_CALL = {
     "workable": workable,
     "recruitee": recruitee,
     "personio": personio,
+    "keka": keka
 }
 
 # tested
@@ -28,4 +29,5 @@ TWO_PHASE = {
     "bamboohr": bamboohr,
     "jobvite": jobvite,
     "workday": workday,
+    # "eightfoldai": eightfoldai
 }

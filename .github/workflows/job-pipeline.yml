@@ -2,8 +2,8 @@ name: job-pipeline
 
 on:
   schedule:
-    - cron: "0 0 1 * *"   # monthly: discover + full pipeline
-    - cron: "0 2 * * *"   # daily: scrape + ingest + sync
+    - cron: "0 0 1 * *" # monthly: discover + full pipeline
+    - cron: "0 2 * * *" # daily: scrape + ingest + sync
   workflow_dispatch:
     inputs:
       run_discover:
@@ -60,7 +60,8 @@ jobs:
       fail-fast: false
       matrix:
         # keep in sync with registry.SINGLE_CALL
-        platform: [greenhouse, ashby, rippling, workable, personio, recruitee]
+        platform:
+          [greenhouse, ashby, rippling, workable, personio, recruitee, keka]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
